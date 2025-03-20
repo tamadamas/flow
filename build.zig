@@ -3,82 +3,89 @@ const builtin = @import("builtin");
 
 const optimize_deps = .ReleaseFast;
 
+/// Struct for all configuration options for building the application.
+/// When adding new build options, please add them to this struct rather than
+/// extending function parameters directly. This helps maintain clean function signatures
+/// and makes it easier to pass configuration throughout the build process.
+const BuildOptions = struct {
+    // Core build steps
+    run_step: *std.Build.Step,
+    check_step: *std.Build.Step,
+    test_step: *std.Build.Step,
+    lint_step: *std.Build.Step,
+
+    // Build configuration
+    target: ?std.Build.ResolvedTarget = null,
+    optimize: ?std.builtin.OptimizeMode = null,
+    exe_install_options: std.Build.Step.InstallArtifact.Options = .{},
+
+    // Feature flags
+    tracy_enabled: bool = false,
+    use_tree_sitter: bool = false,
+    strip: bool = false,
+    use_llvm: bool = false,
+    pie: bool = false,
+    gui: bool = false,
+
+    // Set user config file path
+    config: []const u8 = "",
+};
+
 pub fn build(b: *std.Build) void {
     const release = b.option(bool, "package_release", "Build all release targets") orelse false;
-    const tracy_enabled = b.option(bool, "enable_tracy", "Enable tracy client library (default: no)") orelse false;
-    const use_tree_sitter = b.option(bool, "use_tree_sitter", "Enable tree-sitter (default: yes)") orelse true;
-    const strip = b.option(bool, "strip", "Disable debug information (default: no)");
-    const use_llvm = b.option(bool, "use_llvm", "Enable llvm backend (default: none)");
-    const pie = b.option(bool, "pie", "Produce an executable with position independent code (default: none)");
-    const gui = b.option(bool, "gui", "Standalone GUI mode") orelse false;
 
-    const run_step = b.step("run", "Run the app");
-    const check_step = b.step("check", "Check the app");
-    const test_step = b.step("test", "Run unit tests");
-    const lint_step = b.step("lint", "Run lints");
+    const options = BuildOptions{
+        // Core build steps
+        .run_step = b.step("run", "Run the app"),
+        .check_step = b.step("check", "Check the app"),
+        .test_step = b.step("test", "Run unit tests"),
+        .lint_step = b.step("lint", "Run lints"),
 
-    return (if (release) &build_release else &build_development)(
-        b,
-        run_step,
-        check_step,
-        test_step,
-        lint_step,
-        tracy_enabled,
-        use_tree_sitter,
-        strip,
-        use_llvm,
-        pie,
-        gui,
-    );
+        // Build options
+        .tracy_enabled = b.option(bool, "enable_tracy", "Enable tracy client library (default: no)") orelse false,
+        .use_tree_sitter = b.option(bool, "use_tree_sitter", "Enable tree-sitter (default: yes)") orelse true,
+        .strip = b.option(bool, "strip", "Disable debug information (default: no)"),
+        .use_llvm = b.option(bool, "use_llvm", "Enable llvm backend (default: none)"),
+        .pie = b.option(bool, "pie", "Produce an executable with position independent code (default: none)"),
+        .gui = b.option(bool, "gui", "Standalone GUI mode") orelse false,
+        .config = b.option(
+            []const u8,
+            "config",
+            "Set path to a config file",
+        ) orelse "",
+    };
+
+    return (if (release) &build_release else &build_development)(b, options);
 }
 
 fn build_development(
     b: *std.Build,
-    run_step: *std.Build.Step,
-    check_step: *std.Build.Step,
-    test_step: *std.Build.Step,
-    lint_step: *std.Build.Step,
-    tracy_enabled: bool,
-    use_tree_sitter: bool,
-    strip: ?bool,
-    use_llvm: ?bool,
-    pie: ?bool,
-    gui: bool,
+    opt: BuildOptions,
 ) void {
-    const target = b.standardTargetOptions(.{ .default_target = .{ .abi = if (builtin.os.tag == .linux and !tracy_enabled) .musl else null } });
-    const optimize = b.standardOptimizeOption(.{});
+    opt.target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = if (builtin.os.tag == .linux and !opt.tracy_enabled) .musl else null },
+    });
 
-    return build_exe(
-        b,
-        run_step,
-        check_step,
-        test_step,
-        lint_step,
-        target,
-        optimize,
-        .{},
-        tracy_enabled,
-        use_tree_sitter,
-        strip orelse false,
-        use_llvm,
-        pie,
-        gui,
-    );
+    opt.optimize = b.standardOptimizeOption(.{});
+
+    return build_exe(b, opt);
 }
 
 fn build_release(
     b: *std.Build,
-    run_step: *std.Build.Step,
-    check_step: *std.Build.Step,
-    test_step: *std.Build.Step,
-    lint_step: *std.Build.Step,
-    tracy_enabled: bool,
-    use_tree_sitter: bool,
-    strip: ?bool,
-    use_llvm: ?bool,
-    pie: ?bool,
-    _: bool, //gui
+    opt: BuildOptions,
 ) void {
+    opt.optimize = .ReleaseFast;
+    opt.strip = true;
+
+    var version = std.ArrayList(u8).init(b.allocator);
+    defer version.deinit();
+    gen_version(b, version.writer()) catch unreachable;
+
+    const write_file_step = b.addWriteFiles();
+    const version_file = write_file_step.add("version", version.items);
+    b.getInstallStep().dependOn(&b.addInstallFile(version_file, "version").step);
+
     const targets: []const std.Target.Query = &.{
         .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
         .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .musl },
@@ -89,80 +96,42 @@ fn build_release(
         .{ .cpu_arch = .x86_64, .os_tag = .windows },
         .{ .cpu_arch = .aarch64, .os_tag = .windows },
     };
-    const optimize = .ReleaseFast;
-
-    var version = std.ArrayList(u8).init(b.allocator);
-    defer version.deinit();
-    gen_version(b, version.writer()) catch unreachable;
-    const write_file_step = b.addWriteFiles();
-    const version_file = write_file_step.add("version", version.items);
-    b.getInstallStep().dependOn(&b.addInstallFile(version_file, "version").step);
 
     for (targets) |t| {
-        const target = b.resolveTargetQuery(t);
-        var triple = std.mem.splitScalar(u8, t.zigTriple(b.allocator) catch unreachable, '-');
-        const arch = triple.next() orelse unreachable;
-        const os = triple.next() orelse unreachable;
-        const target_path = std.mem.join(b.allocator, "-", &[_][]const u8{ os, arch }) catch unreachable;
+        opt.target = b.resolveTargetQuery(t);
+        const target_path = blk: {
+            var triple = std.mem.splitScalar(u8, t.zigTriple(b.allocator) catch unreachable, '-');
+            const arch = triple.next() orelse unreachable;
+            const os = triple.next() orelse unreachable;
 
-        build_exe(
-            b,
-            run_step,
-            check_step,
-            test_step,
-            lint_step,
-            target,
-            optimize,
-            .{ .dest_dir = .{ .override = .{ .custom = target_path } } },
-            tracy_enabled,
-            use_tree_sitter,
-            strip orelse true,
-            use_llvm,
-            pie,
-            false, //gui
-        );
+            break :blk std.mem.join(b.allocator, "-", &[_][]const u8{ os, arch }) catch unreachable;
+        };
 
-        if (t.os_tag == .windows)
-            build_exe(
-                b,
-                run_step,
-                check_step,
-                test_step,
-                lint_step,
-                target,
-                optimize,
-                .{ .dest_dir = .{ .override = .{ .custom = target_path } } },
-                tracy_enabled,
-                use_tree_sitter,
-                strip orelse true,
-                use_llvm,
-                pie,
-                true, //gui
-            );
+        opt.exe_install_options = .{
+            .dest_dir = .{
+                .override = .{
+                    .custom = target_path,
+                },
+            },
+        };
+
+        if (t.os_tag == .windows) {
+            opt.gui = true;
+        }
+
+        build_exe(b, opt);
     }
 }
 
 pub fn build_exe(
     b: *std.Build,
-    run_step: *std.Build.Step,
-    check_step: *std.Build.Step,
-    test_step: *std.Build.Step,
-    lint_step: *std.Build.Step,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    exe_install_options: std.Build.Step.InstallArtifact.Options,
-    tracy_enabled: bool,
-    use_tree_sitter: bool,
-    strip: bool,
-    use_llvm: ?bool,
-    pie: ?bool,
-    gui: bool,
+    opt: BuildOptions,
 ) void {
     const options = b.addOptions();
-    options.addOption(bool, "enable_tracy", tracy_enabled);
-    options.addOption(bool, "use_tree_sitter", use_tree_sitter);
-    options.addOption(bool, "strip", strip);
-    options.addOption(bool, "gui", gui);
+    options.addOption(bool, "enable_tracy", opt.tracy_enabled);
+    options.addOption(bool, "use_tree_sitter", opt.use_tree_sitter);
+    options.addOption(bool, "strip", opt.strip);
+    options.addOption(bool, "gui", opt.gui);
 
     const options_mod = options.createModule();
 
@@ -177,7 +146,7 @@ pub fn build_exe(
 
     var version_info = std.ArrayList(u8).init(b.allocator);
     defer version_info.deinit();
-    gen_version_info(b, target, version_info.writer(), optimize) catch {
+    gen_version_info(b, opt.target, version_info.writer(), opt.optimize) catch {
         version_info.clearAndFree();
         version_info.appendSlice("unknown") catch {};
     };
@@ -186,60 +155,60 @@ pub fn build_exe(
     const version_info_file = wf.add("version", version_info.items);
 
     const vaxis_dep = b.dependency("vaxis", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
     const vaxis_mod = vaxis_dep.module("vaxis");
 
     const flags_dep = b.dependency("flags", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
 
     const dizzy_dep = b.dependency("dizzy", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
 
     const fuzzig_dep = b.dependency("fuzzig", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
 
     const thespian_dep = b.dependency("thespian", .{
-        .target = target,
-        .optimize = optimize_deps,
-        .enable_tracy = tracy_enabled,
+        .target = opt.target,
+        .optimize = opt.optimize_deps,
+        .enable_tracy = opt.tracy_enabled,
     });
 
     const thespian_mod = thespian_dep.module("thespian");
     const cbor_mod = thespian_dep.module("cbor");
 
-    const tracy_dep = if (tracy_enabled) thespian_dep.builder.dependency("tracy", .{
-        .target = target,
-        .optimize = optimize,
+    const tracy_dep = if (opt.tracy_enabled) thespian_dep.builder.dependency("tracy", .{
+        .target = opt.target,
+        .optimize = opt.optimize,
     }) else undefined;
-    const tracy_mod = if (tracy_enabled) tracy_dep.module("tracy") else b.createModule(.{
+    const tracy_mod = if (opt.tracy_enabled) tracy_dep.module("tracy") else b.createModule(.{
         .root_source_file = b.path("src/tracy_noop.zig"),
     });
 
     const zg_dep = vaxis_dep.builder.dependency("zg", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
 
     const zeit_dep = b.dependency("zeit", .{
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
     const zeit_mod = zeit_dep.module("zeit");
 
     const themes_dep = b.dependency("themes", .{});
 
     const syntax_dep = b.dependency("syntax", .{
-        .target = target,
-        .optimize = optimize_deps,
-        .use_tree_sitter = use_tree_sitter,
+        .target = opt.target,
+        .optimize = opt.optimize_deps,
+        .use_tree_sitter = opt.use_tree_sitter,
     });
     const syntax_mod = syntax_dep.module("syntax");
 
@@ -319,7 +288,7 @@ pub fn build_exe(
     });
 
     const renderer_mod = blk: {
-        if (gui) switch (target.result.os.tag) {
+        if (opt.gui) switch (opt.target.result.os.tag) {
             .windows => {
                 const win32_dep = b.lazyDependency("win32", .{}) orelse break :blk tui_renderer_mod;
                 const win32_mod = win32_dep.module("win32");
@@ -380,8 +349,8 @@ pub fn build_exe(
     const keybind_test_run_cmd = blk: {
         const tests = b.addTest(.{
             .root_source_file = b.path("src/keybind/keybind.zig"),
-            .target = target,
-            .optimize = optimize,
+            .target = opt.target,
+            .optimize = opt.optimize,
         });
         tests.root_module.addImport("cbor", cbor_mod);
         tests.root_module.addImport("command", command_mod);
@@ -482,22 +451,22 @@ pub fn build_exe(
         },
     });
 
-    const exe_name = if (gui) "flow-gui" else "flow";
+    const exe_name = if (opt.gui) "flow-gui" else "flow";
 
     const exe = b.addExecutable(.{
         .name = exe_name,
         .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
+        .target = opt.target,
+        .optimize = opt.optimize,
+        .strip = opt.strip,
         .win32_manifest = b.path("src/win32/flow.manifest"),
     });
 
-    if (use_llvm) |value| {
+    if (opt.use_llvm) |value| {
         exe.use_llvm = value;
         exe.use_lld = value;
     }
-    if (pie) |value| exe.pie = value;
+    if (opt.pie) |value| exe.pie = value;
     exe.root_module.addImport("build_options", options_mod);
     exe.root_module.addImport("flags", flags_dep.module("flags"));
     exe.root_module.addImport("cbor", cbor_mod);
@@ -513,16 +482,16 @@ pub fn build_exe(
     exe.root_module.addImport("color", color_mod);
     exe.root_module.addImport("version_info", b.createModule(.{ .root_source_file = version_info_file }));
 
-    if (target.result.os.tag == .windows) {
+    if (opt.target.result.os.tag == .windows) {
         exe.addWin32ResourceFile(.{
             .file = b.path("src/win32/flow.rc"),
         });
-        if (gui) {
+        if (opt.gui) {
             exe.subsystem = .Windows;
         }
     }
 
-    const exe_install = b.addInstallArtifact(exe, exe_install_options);
+    const exe_install = b.addInstallArtifact(exe, opt.exe_install_options);
     b.getInstallStep().dependOn(&exe_install.step);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -531,13 +500,13 @@ pub fn build_exe(
         run_cmd.addArgs(args);
     }
 
-    run_step.dependOn(&run_cmd.step);
+    opt.run_step.dependOn(&run_cmd.step);
 
     const check_exe = b.addExecutable(.{
         .name = exe_name,
         .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .target = opt.target,
+        .optimize = opt.optimize,
     });
 
     check_exe.root_module.addImport("build_options", options_mod);
@@ -554,18 +523,18 @@ pub fn build_exe(
     check_exe.root_module.addImport("syntax", syntax_mod);
     check_exe.root_module.addImport("color", color_mod);
     check_exe.root_module.addImport("version_info", b.createModule(.{ .root_source_file = version_info_file }));
-    check_step.dependOn(&check_exe.step);
+    opt.check_step.dependOn(&check_exe.step);
 
     const tests = b.addTest(.{
         .root_source_file = b.path("test/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-        .strip = strip,
+        .target = opt.target,
+        .optimize = opt.optimize,
+        .use_llvm = opt.use_llvm,
+        .use_lld = opt.use_llvm,
+        .strip = opt.strip,
     });
 
-    tests.pie = pie;
+    tests.pie = opt.pie;
     tests.root_module.addImport("build_options", options_mod);
     tests.root_module.addImport("log", log_mod);
     tests.root_module.addImport("Buffer", Buffer_mod);
@@ -574,16 +543,16 @@ pub fn build_exe(
 
     const test_run_cmd = b.addRunArtifact(tests);
 
-    test_step.dependOn(&test_run_cmd.step);
-    test_step.dependOn(&keybind_test_run_cmd.step);
+    opt.test_step.dependOn(&test_run_cmd.step);
+    opt.test_step.dependOn(&keybind_test_run_cmd.step);
 
     const lints = b.addFmt(.{
         .paths = &.{ "src", "test", "build.zig" },
         .check = true,
     });
 
-    lint_step.dependOn(&lints.step);
-    b.default_step.dependOn(lint_step);
+    opt.lint_step.dependOn(&lints.step);
+    b.default_step.dependOn(opt.lint_step);
 }
 
 fn gen_version_info(
